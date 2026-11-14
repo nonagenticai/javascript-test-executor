@@ -48,7 +48,7 @@
     "glob": "^10.4.0",
     "mkdirp": "^3.0.1",
     "inflight": "npm:@npmcli/fs@^3.1.0",
-    "serialize-javascript": "^7.0.5"
+    "serialize-javascript": "^7.1.4"
   },
   "engines": {
     "node": ">=24.0.0"
