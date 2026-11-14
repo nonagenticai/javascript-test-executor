@@ -212,3 +212,13 @@ There is no deploy job: this service is retired from the estate's cluster, and t
 - **Security validation not applied to /execute** — `validateCodeSecurity` exists and blocks dangerous imports (`fs`, `child_process`, `eval`, etc.) but no route calls it. This is a real gap, tracked here rather than papered over; `/info` no longer claims `security_validation`.
 - **No TypeScript type checking** — `/execute` transpiles TS with babel-jest (`@babel/preset-typescript`), which STRIPS types without checking them. Nothing runs `tsc`. `TYPESCRIPT_CONFIGS` and its strict/moderate/permissive levels were deleted with the dead path; `/info` reports `type_checking: false` and an empty `typescript_strictness_levels`.
 - **Unused redis dependency** — `redis` is listed in `package.json` but never imported or used in the code.
+
+## Licensing
+
+The code in this repository is Apache-2.0 and needs no licence key to build, test or run.
+It contains no licence-enforcement code: the Apache-2.0 licence in [`LICENSE`](LICENSE) is the
+only licence that applies, and no licence server is involved.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE).
