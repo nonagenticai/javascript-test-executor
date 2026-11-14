@@ -17,6 +17,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    # @babel/core 8 is a whole-toolchain major, not a bump: @babel/preset-env 7.29
+    # requires core ^7.0.0-0, so the image build's `npm ci` fails ERESOLVE with core
+    # 8.1.0 (PR #4, run 43618410203). Hold it until preset-env 8 and the plugin set
+    # can move together; the checks job passes alone because it never installs /src.
+    ignore:
+      - dependency-name: "@babel/core"
+        versions: [">=8.0.0"]
     groups:
       minor-patch:
         patterns: ["*"]
