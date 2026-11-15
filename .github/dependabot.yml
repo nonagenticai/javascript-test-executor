@@ -2,6 +2,10 @@ version: 2
 
 # Dependabot replaces the org's private Renovate preset: a public repository cannot inherit a
 # preset hosted in a private one.
+
+# package.json and src/package.json carry a range-scoped `minimatch` override for
+# GHSA-g3hv-75wg-m249 (vulnerable >=7.0.0 <11.0.1, no patched 10.x, and jest cannot cross to 11
+# in range). Without the override the security-update job errors instead of opening a PR.
 updates:
   - package-ecosystem: npm
     directory: "/"
