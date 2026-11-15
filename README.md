@@ -167,6 +167,8 @@ Any unmatched route returns HTTP 404:
 | `PORT` | `8085` | HTTP listen port |
 | `EXECUTION_TIMEOUT` | `30` | Test timeout in seconds (converted to ms internally) |
 | `TEMP_DIR` | `/tmp` | Base temp directory (read but not used -- `/execute` uses `os.tmpdir()`, `/validate` uses hardcoded `/app/test_workspace/`) |
+| `RATE_LIMIT_MAX` | `60` | Requests per client address per window across `/execute` and `/validate` before the service returns `429` |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window in milliseconds |
 
 Dockerfile also sets:
 | Variable | Value | Description |

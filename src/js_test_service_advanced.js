@@ -30,6 +30,7 @@ const {
     installGracefulShutdown,
 } = require('./common');
 const { spawn, exec } = require('child_process');
+const { rateLimit } = require('express-rate-limit');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
@@ -40,6 +41,31 @@ const PORT = process.env.PORT || 8085;
 const EXECUTION_TIMEOUT = parseInt(process.env.EXECUTION_TIMEOUT || '30') * 1000;
 const TEMP_DIR = process.env.TEMP_DIR || '/tmp';
 const TEST_WORKSPACE = process.env.TEST_WORKSPACE || '/app/test_workspace';
+
+// ── Rate limiting ───────────────────────────────────────────────────────────
+// /execute writes a project into a temp dir and spawns Jest; /validate writes
+// a source file and runs `node --check`. Each request is CPU and scratch-disk
+// work, and CodeQL js/missing-rate-limiting raised both routes. This is an
+// in-process counter keyed on the caller's address: the orchestrator is the
+// only caller (tenantGuard), so there is one meaningful bucket, and an
+// external attacker cannot bypass it by rotating addresses. Defaults: 60
+// requests per 60 s, overridable with RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_MS.
+// Invalid overrides fall back to the default rather than disabling the limit.
+function positiveIntFromEnv(name, fallback) {
+    const parsed = Number.parseInt(process.env[name], 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const RATE_LIMIT_MAX = positiveIntFromEnv('RATE_LIMIT_MAX', 60);
+const RATE_LIMIT_WINDOW_MS = positiveIntFromEnv('RATE_LIMIT_WINDOW_MS', 60 * 1000);
+
+const expensiveRouteLimiter = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: RATE_LIMIT_MAX,
+    standardHeaders: true, // RateLimit-Limit / -Remaining / -Reset on responses
+    legacyHeaders: false,
+    message: { error: 'Too many requests', detail: 'This executor is rate-limited.' },
+});
 
 // Initialize Express app with shared setup + orchestrator-only tenant guard
 const app = setupExpress({ jsonLimit: '10mb' });
@@ -69,6 +95,92 @@ const SUPPORTED_FRAMEWORKS = {
 // The framework /execute uses when the caller does not name one.
 const DEFAULT_FRAMEWORK = 'jest';
 
+// ── Linear scan for `require('crypto') ... .createHash` ────────────────────
+// The old check was the regular expression
+//   /require\s*\(\s*['"]crypto['"].*\.createHash/i
+// which CodeQL reported as js/polynomial-redos: on input such as
+// `require("crypto"` repeated many times with no `.createHash`, the engine
+// restarts the `.*` scan from every later `require`, so a 200 KB body is
+// quadratic. This scanner walks the input once. It is the exact equivalent of
+// that regex: the prefix allows the ECMAScript `\s` set (including line
+// terminators) between the tokens, while `.` after the quoted module name does
+// NOT cross a line terminator, so a pending prefix is dropped at \n, \r,
+// \u2028 or \u2029. Matching is ASCII case-insensitive, as the old `i` flag was
+// for these literal words.
+const WHITESPACE_CHARS = new Set([
+    ' ', '\t', '\n', '\v', '\f', '\r', '\u00a0', '\u1680', '\u2000', '\u2001',
+    '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2007', '\u2008', '\u2009',
+    '\u200a', '\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff',
+]);
+
+// `.` (unlike `\s`) does not match these.
+const LINE_TERMINATORS = new Set(['\n', '\r', '\u2028', '\u2029']);
+
+function matchesAsciiWord(code, start, word) {
+    if (start + word.length > code.length) {
+        return false;
+    }
+    for (let offset = 0; offset < word.length; offset += 1) {
+        if (code[start + offset].toLowerCase() !== word[offset]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Match `require\s*\(\s*['"]crypto['"]` at `start` (ASCII case-insensitive).
+ * Returns the index just past the closing quote, or -1.
+ */
+function matchRequireCryptoPrefix(code, start) {
+    if (!matchesAsciiWord(code, start, 'require')) return -1;
+    let index = start + 'require'.length;
+
+    while (index < code.length && WHITESPACE_CHARS.has(code[index])) index += 1;
+    if (code[index] !== '(') return -1;
+    index += 1;
+
+    while (index < code.length && WHITESPACE_CHARS.has(code[index])) index += 1;
+    const quote = code[index];
+    if (quote !== '"' && quote !== "'") return -1;
+    index += 1;
+
+    if (!matchesAsciiWord(code, index, 'crypto')) return -1;
+    index += 'crypto'.length;
+
+    if (code[index] !== quote) return -1;
+    return index + 1;
+}
+
+/**
+ * True when `code` contains the old regex's match: a require of the crypto
+ * module followed, on the same line, by `.createHash`.
+ */
+function containsCryptoCreateHashRequire(code) {
+    let pending = false;
+    let index = 0;
+    while (index < code.length) {
+        const prefixEnd = matchRequireCryptoPrefix(code, index);
+        if (prefixEnd !== -1) {
+            // `.createHash` may follow immediately or later on this line.
+            pending = true;
+            index = prefixEnd;
+            continue;
+        }
+        const character = code[index];
+        if (LINE_TERMINATORS.has(character)) {
+            pending = false;
+            index += 1;
+            continue;
+        }
+        if (pending && character === '.' && matchesAsciiWord(code, index + 1, 'createhash')) {
+            return true;
+        }
+        index += 1;
+    }
+    return false;
+}
+
 // Security validation
 function validateCodeSecurity(code) {
     const dangerousPatterns = [
@@ -76,7 +188,6 @@ function validateCodeSecurity(code) {
         /require\s*\(\s*['"]child_process['"]|child_process\./i,
         /require\s*\(\s*['"]net['"]|net\./i,
         /require\s*\(\s*['"]http['"]|http\./i,
-        /require\s*\(\s*['"]crypto['"].*\.createHash/i,
         /eval\s*\(/i,
         /Function\s*\(/i,
         /process\.exit/i,
@@ -89,6 +200,12 @@ function validateCodeSecurity(code) {
         if (pattern.test(code)) {
             throw new Error(`Security violation: Potentially dangerous code pattern detected`);
         }
+    }
+
+    // Linear replacement for the crypto matcher CodeQL flagged as
+    // js/polynomial-redos (see containsCryptoCreateHashRequire above).
+    if (containsCryptoCreateHashRequire(code)) {
+        throw new Error(`Security violation: Potentially dangerous code pattern detected`);
     }
 }
 
@@ -258,7 +375,7 @@ app.get('/health', (req, res) => {
 });
 
 // Execute test with advanced features
-app.post('/execute', async (req, res) => {
+app.post('/execute', expensiveRouteLimiter, async (req, res) => {
     const { code, test_code, language, timeout = 30000, test_framework } = req.body;
     const testId = crypto.randomUUID();
     const tempDir = path.join(os.tmpdir(), `test-${testId}`);
@@ -612,8 +729,31 @@ function isSafeFilename(filename) {
     return SAFE_FILENAME.test(filename);
 }
 
+/**
+ * Resolve `relativePath` beneath `root` and refuse anything that escapes it.
+ *
+ * js/path-injection flagged the write in /validate: the SAFE_FILENAME check
+ * above constrains the value, but a validation regex is not a path operation
+ * and the query does not treat it as one. The pattern the query models is
+ * normalise-then-compare: resolve both sides and require the result to be the
+ * root itself or to sit under `root + path.sep` — the separator boundary is
+ * what stops a sibling directory sharing the root's prefix (for example
+ * `/app/test_workspace_evil`) from passing a bare prefix test. The RESOLVED
+ * path is what the caller then uses for the file operation.
+ *
+ * Returns the normalised path, or null when it escapes the root.
+ */
+function resolveWithinRoot(root, relativePath) {
+    const resolvedRoot = path.resolve(root);
+    const resolved = path.resolve(resolvedRoot, relativePath);
+    if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) {
+        return null;
+    }
+    return resolved;
+}
+
 // Validate JavaScript/TypeScript code syntax
-app.post('/validate', async (req, res) => {
+app.post('/validate', expensiveRouteLimiter, async (req, res) => {
     const validationId = crypto.randomUUID();
     
     try {
@@ -666,8 +806,24 @@ app.post('/validate', async (req, res) => {
         // Create temporary file for validation
         const tempPath = path.join(TEST_WORKSPACE, validationId);
         await fs.mkdir(tempPath, { recursive: true });
-        
-        const jsFile = path.join(tempPath, filename);
+
+        // `filename` is validated as a plain file name above, but a validation
+        // regex is not a path operation and CodeQL js/path-injection does not
+        // follow it. Resolve the file against the validation directory and
+        // require the normalised path to sit under `root + path.sep` (the
+        // component boundary stops a sibling directory sharing the root's
+        // prefix) before it reaches fs; the normalised path is what gets
+        // written.
+        const jsFile = resolveWithinRoot(tempPath, filename);
+        if (!jsFile) {
+            await fs.rm(tempPath, { recursive: true, force: true });
+            return res.status(400).json({
+                validationId,
+                valid: false,
+                errors: ['filename must resolve inside the validation workspace'],
+                output: ''
+            });
+        }
         await fs.writeFile(jsFile, code);
         
         // Try to parse the file with Node.js syntax checker
@@ -752,6 +908,9 @@ if (require.main === module) {
 module.exports = {
     app,
     validateCodeSecurity,
+    containsCryptoCreateHashRequire,
+    resolveWithinRoot,
+    isSafeFilename,
     generateTestId,
     createTempDir,
     cleanup,
